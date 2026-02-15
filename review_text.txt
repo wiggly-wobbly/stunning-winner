@@ -1,0 +1,468 @@
+import pandas as pd
+import numpy as np
+import networkx as nx
+import re
+import json
+import os
+from datetime import timedelta
+from pyvis.network import Network
+
+# ==========================================
+# 1. Configuration & Constants
+# ==========================================
+
+FORMULA_STOPWORDS = {
+    'if', 'sum', 'avg', 'count', 'max', 'min', 'and', 'or', 'not', 'true', 'false', 
+    'date', 'year', 'month', 'day', 'int', 'float', 'str', 'coalesce', 'concat',
+    'return', 'where', 'select', 'case', 'when', 'then', 'else', 'end', 'isnull',
+    'left', 'right', 'mid', 'len', 'trim', 'value'
+}
+
+INTENT_MAP = {
+    'filter': 'Data Segmentation & Quality Control',
+    'drop': 'Noise Reduction & Cleanup',
+    'convert': 'Format Standardization',
+    'rename': 'Business Field Mapping',
+    'lookup': 'Data Enrichment',
+    'multilookup': 'Complex Data Enrichment',
+    'merge': 'Dataset Integration',
+    'calculate': 'Metric Derivation',
+    'sum': 'Performance Aggregation',
+    'pivot': 'Report Structuring',
+    'multicopy': 'Source Data Ingestion',
+    'load': 'Source Data Ingestion',
+    'cross_var_flow': 'Cross-Process Integration',
+    'conditional': 'Business Rule Application',
+    'append': 'Data Consolidation',
+    'save': 'Data Persistence'
+}
+
+# ==========================================
+# 2. The Execution Engine (Data Processing)
+# ==========================================
+
+class RulebookExecutor:
+    """
+    Executes the data transformations defined in the rulebook using Pandas.
+    """
+    def __init__(self):
+        self.data_store = {} # Holds active dataframes
+
+    def register_dataframe(self, name, df):
+        self.data_store[name] = df
+
+    def get_dataframe(self, name):
+        return self.data_store.get(name)
+
+    def _parse_params(self, param_str):
+        if pd.isna(param_str): return []
+        return [x.strip() for x in str(param_str).split(',')]
+
+    def execute(self, rulebook_path):
+        """Main loop to process the rulebook row by row."""
+        # Load rulebook
+        if rulebook_path.endswith('.csv'):
+            rb = pd.read_csv(rulebook_path)
+        else:
+            rb = pd.read_excel(rulebook_path)
+        
+        # Normalize columns
+        rb.columns = [c.lower().strip() for c in rb.columns]
+        rb = rb.sort_values('transformation_order')
+
+        print(f"--- Executing Rulebook: {os.path.basename(rulebook_path)} ---")
+
+        for _, row in rb.iterrows():
+            try:
+                self._process_step(row)
+            except Exception as e:
+                print(f"Error in Step {row.get('transformation_order')}: {e}")
+
+    def _process_step(self, row):
+        op = str(row['operation']).lower().strip()
+        target_sys = row.get('target_system')
+        source_sys = row.get('source_system')
+        source_data = row.get('source_data')
+        tgt_var = row.get('target_variable')
+        src_var = row.get('source_variable')
+        param = row.get('parameter')
+
+        # Resolve Source DataFrame
+        df = None
+        if source_sys in self.data_store:
+            df = self.data_store[source_sys]
+        elif target_sys in self.data_store:
+            df = self.data_store[target_sys]
+
+        # --- Operations Implementation ---
+        
+        if op == 'multicopy' or op == 'load':
+            # Simplified loader
+            if str(source_data).endswith('.csv'):
+                self.data_store[target_sys] = pd.read_csv(source_data)
+            elif str(source_data).endswith(('.xls', '.xlsx')):
+                self.data_store[target_sys] = pd.read_excel(source_data)
+            print(f"Loaded {target_sys} from {source_data}")
+
+        elif op == 'filter':
+            # Param: "Col > 100"
+            self.data_store[target_sys] = df.query(str(param))
+
+        elif op == 'convert':
+            col = src_var
+            if param == 'float':
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+            elif param == 'date':
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+            elif param == 'string':
+                df[col] = df[col].astype(str)
+
+        elif op == 'calculate' or op == 'formula':
+            # Param: "ColA + ColB"
+            df[tgt_var] = df.eval(str(param))
+
+        elif op == 'rename':
+            # Param: "old":"new"
+            pairs = [x.split(':') for x in self._parse_params(param)]
+            mapper = {p[0].strip().replace('"',''): p[1].strip().replace('"','') for p in pairs}
+            self.data_store[target_sys] = df.rename(columns=mapper)
+
+        elif op == 'lookup' or op == 'merge':
+            # Join logic
+            lookup_df = self.data_store[row['lookup_table']]
+            left_on = src_var
+            right_on = row['lookup_key']
+            # Simple left merge
+            merged = pd.merge(df, lookup_df, left_on=left_on, right_on=right_on, how='left')
+            
+            # If specific column requested
+            if pd.notna(row['lookup_column']):
+                # Handle column conflict naming if needed
+                df[tgt_var if pd.notna(tgt_var) else row['lookup_column']] = merged[row['lookup_column']]
+            else:
+                self.data_store[target_sys] = merged
+
+        elif op == 'sum':
+            # Param: GroupByCol
+            grp = self._parse_params(param)
+            self.data_store[target_sys] = df.groupby(grp)[src_var].sum().reset_index()
+
+        elif op == 'save':
+            df.to_excel(str(param), index=False)
+            print(f"Saved output to {param}")
+
+        # ... (Add other operations from previous 47 item list as needed) ...
+
+        # Update store if df was modified in place
+        if df is not None:
+            self.data_store[target_sys] = df
+
+# ==========================================
+# 3. The Lineage Architect (Graph Building)
+# ==========================================
+
+class LineageArchitect:
+    """
+    Parses rulebooks to build a NetworkX graph of system and variable dependencies.
+    """
+    def __init__(self):
+        self.global_graph = nx.MultiDiGraph()
+        self.system_registry = {} # Map: system_name -> rulebook_name
+
+    def _get_node_id(self, rulebook, system, variable=None):
+        clean_sys = str(system).strip()
+        if variable:
+            return f"{rulebook}::{clean_sys}::{str(variable).strip()}"
+        return f"{rulebook}::{clean_sys}"
+
+    def _extract_vars_from_param(self, param):
+        """Extracts variable names from formulas using Regex."""
+        if pd.isna(param): return []
+        # Remove strings "..."
+        no_strings = re.sub(r'([\'"])(?:(?=(\\?))\2.)*?\1', '', str(param))
+        # Find words
+        candidates = re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*', no_strings)
+        # Filter stopwords
+        return [c for c in candidates if c.lower() not in FORMULA_STOPWORDS]
+
+    def ingest_rulebook(self, rulebook_name, df_rulebook):
+        """Ingests a rulebook DataFrame into the lineage graph."""
+        df = df_rulebook.copy()
+        df.columns = [c.lower().strip() for c in df.columns]
+        if 'transformation_order' in df.columns:
+            df = df.sort_values('transformation_order')
+
+        # 1. Register Systems
+        for sys in df['target_system'].unique():
+            if pd.notna(sys): self.system_registry[sys] = rulebook_name
+
+        # 2. Build Edges
+        for _, row in df.iterrows():
+            self._process_lineage_row(rulebook_name, row)
+
+    def _process_lineage_row(self, rb_name, row):
+        op = str(row.get('operation', '')).lower().strip()
+        step = row.get('transformation_order')
+        tgt_sys = row.get('target_system')
+        src_sys = row.get('source_system')
+        src_data = row.get('source_data')
+        tgt_var = row.get('target_variable')
+        src_var_raw = row.get('source_variable')
+        param = row.get('parameter')
+
+        # --- System Lineage ---
+        if pd.notna(src_sys):
+            u = self._get_node_id(rb_name, src_sys)
+            v = self._get_node_id(rb_name, tgt_sys)
+            self.global_graph.add_edge(u, v, type='system_flow', label=op, step=step)
+
+        # Cross-Rulebook / File Linking
+        if pd.notna(src_data):
+            if src_data in self.system_registry:
+                # Link to other rulebook
+                origin_rb = self.system_registry[src_data]
+                u = self._get_node_id(origin_rb, src_data)
+                v = self._get_node_id(rb_name, tgt_sys)
+                self.global_graph.add_edge(u, v, type='cross_link', label='handoff', step=step)
+            else:
+                # Link to File
+                u = f"FILE::{src_data}"
+                v = self._get_node_id(rb_name, tgt_sys)
+                self.global_graph.add_edge(u, v, type='file_load', label='load', step=step)
+
+        # --- Variable Lineage ---
+        
+        # Gather Source Variables
+        sources = set()
+        if pd.notna(src_var_raw):
+            sources.update([x.strip() for x in str(src_var_raw).split(',')])
+        
+        # Implicit sources in formulas
+        if op in ['calculate', 'conditional', 'formula']:
+            sources.update(self._extract_vars_from_param(param))
+
+        # Handle Lookups
+        if op in ['lookup', 'merge'] and pd.notna(row.get('lookup_column')):
+            lkp_tbl = row.get('lookup_table')
+            lkp_col = row.get('lookup_column')
+            lkp_node = self._get_node_id(rb_name, lkp_tbl, lkp_col)
+            
+            # Destination
+            eff_tgt = tgt_var if pd.notna(tgt_var) else lkp_col
+            t_node = self._get_node_id(rb_name, tgt_sys, eff_tgt)
+            
+            self.global_graph.add_edge(lkp_node, t_node, type='lookup_flow', label=op, step=step)
+
+        # Standard Column Ops
+        if pd.notna(tgt_var):
+            targets = [x.strip() for x in str(tgt_var).split(',')]
+            for t_var in targets:
+                t_node = self._get_node_id(rb_name, tgt_sys, t_var)
+                for s_var in sources:
+                    s_sys = src_sys if pd.notna(src_sys) else tgt_sys
+                    s_node = self._get_node_id(rb_name, s_sys, s_var)
+                    self.global_graph.add_edge(s_node, t_node, type='variable_flow', label=op, step=step, param=param)
+
+    def stitch_rulebooks(self):
+        """Creates implicit variable links between connected systems."""
+        cross_links = [(u, v) for u, v, d in self.global_graph.edges(data=True) if d.get('type') == 'cross_link']
+        for src_sys_node, tgt_sys_node in cross_links:
+            # Find vars in source
+            src_vars = [n for n in self.global_graph.nodes() if n.startswith(src_sys_node + "::")]
+            for s_node in src_vars:
+                var_name = s_node.split("::")[-1]
+                t_node = f"{tgt_sys_node}::{var_name}"
+                # Create identity flow
+                self.global_graph.add_edge(s_node, t_node, type='cross_var_flow', label='handoff')
+
+# ==========================================
+# 4. The Semantic Narrator (NLP / Explanations)
+# ==========================================
+
+class SemanticNarrator:
+    def __init__(self, architect, target_node):
+        self.graph = architect.global_graph
+        self.target = target_node
+
+    def _parse(self, node):
+        p = node.split("::")
+        return {"rb": p[0], "sys": p[1], "var": p[2]} if len(p) == 3 else {"type": "file", "name": p[-1]}
+
+    def explain(self):
+        if self.target not in self.graph:
+            return f"Error: Node {self.target} not found."
+
+        ancestors = nx.ancestors(self.graph, self.target)
+        sub = self.graph.subgraph(ancestors.union({self.target}))
+        
+        try:
+            nodes = list(nx.topological_sort(sub))
+        except:
+            nodes = list(sub.nodes()) # Cycle fallback
+
+        t_info = self._parse(self.target)
+        story = [f"### Data Journey: {t_info['var']}"]
+        story.append(f"**Final System:** {t_info['sys']} (Rulebook: {t_info['rb']})")
+        story.append("-" * 40)
+        
+        step = 1
+        for n in nodes:
+            in_edges = list(sub.in_edges(n, data=True))
+            if not in_edges: continue
+            
+            info = self._parse(n)
+            if info.get('type') == 'file': continue
+            
+            # Logic grouping
+            op = in_edges[0][2].get('label', 'transform')
+            param = in_edges[0][2].get('param', '')
+            intent = INTENT_MAP.get(op, 'Data Transformation')
+            
+            # Sentences
+            if op in ['load', 'multicopy']:
+                srcs = [self._parse(u)['name'] for u,v,d in in_edges if 'FILE' in u]
+                txt = f"Data was **ingested** from `{', '.join(srcs)}`."
+            elif op == 'filter':
+                txt = f"Applied a **Quality Filter**: Kept rows where `{param}`."
+            elif op == 'calculate':
+                txt = f"**Calculated** new value using formula: `{param}`."
+            elif op == 'lookup_flow':
+                txt = f"**Enriched** data by looking up `{info['var']}` from reference table."
+            elif op == 'cross_var_flow':
+                txt = "Data **crossed system boundaries** (Input from upstream rulebook)."
+            else:
+                txt = f"Performed **{op}** operation."
+
+            story.append(f"**Step {step} ({intent}):** {txt}")
+            step += 1
+            
+        return "\n".join(story)
+
+# ==========================================
+# 5. The Interactive Visualizer (HTML Graph)
+# ==========================================
+
+class InteractiveVisualizer:
+    def __init__(self, architect):
+        self.graph = architect.global_graph
+
+    def plot_upstream(self, target_node, filename="lineage.html"):
+        if target_node not in self.graph:
+            print("Target node not found.")
+            return
+
+        ancestors = nx.ancestors(self.graph, target_node)
+        sub = self.graph.subgraph(ancestors.union({target_node}))
+        
+        net = Network(height="800px", width="100%", directed=True, select_menu=True, cdn_resources='remote')
+        
+        for n in sub.nodes():
+            # Style based on type
+            if "FILE" in n:
+                color = "#E0E0E0"
+                shape = "square"
+                label = n.split("::")[-1]
+            elif n == target_node:
+                color = "#FF6961"
+                shape = "star"
+                label = n.split("::")[-1]
+            else:
+                color = "#97C2FC"
+                shape = "dot"
+                parts = n.split("::")
+                label = parts[2] if len(parts) > 2 else parts[1]
+
+            title = n.replace("::", "\n↳ ")
+            net.add_node(n, label=label[:15], title=title, color=color, shape=shape)
+
+        for u, v, d in sub.edges(data=True):
+            net.add_edge(u, v, label=d.get('label'), color="#848484", arrows='to')
+
+        # Hierarchical Layout Options
+        net.set_options(json.dumps({
+            "layout": {
+                "hierarchical": {
+                    "enabled": True,
+                    "direction": "LR",
+                    "sortMethod": "directed",
+                    "levelSeparation": 200
+                }
+            },
+            "physics": {"enabled": False},
+            "interaction": {"hover": True, "navigationButtons": True}
+        }))
+        
+        net.save_graph(filename)
+        print(f"Graph saved to {filename}")
+
+# ==========================================
+# 6. Main Execution Demo
+# ==========================================
+
+if __name__ == "__main__":
+    # --- A. Setup Dummy Data ---
+    print("Generating Dummy Data...")
+    
+    # 1. Raw Sales File
+    df_sales = pd.DataFrame({
+        'TxnID': [1, 2, 3],
+        'Gross': [100, 200, 300],
+        'Tax': [10, 20, 30],
+        'Status': ['Ok', 'Void', 'Ok']
+    })
+    df_sales.to_csv('sales_raw.csv', index=False)
+
+    # 2. Rulebook 1: Cleaning
+    rb1_data = {
+        'transformation_order': [1, 2, 3, 4],
+        'target_system': ['Clean_Sales', 'Clean_Sales', 'Clean_Sales', 'Clean_Sales'],
+        'source_system': ['file', 'Clean_Sales', 'Clean_Sales', 'Clean_Sales'],
+        'source_data': ['sales_raw.csv', '', '', ''],
+        'target_variable': ['', '', 'Net_Amount', ''],
+        'source_variable': ['', '', 'Gross, Tax', ''],
+        'operation': ['multicopy', 'filter', 'calculate', 'save'],
+        'parameter': ['', 'Status != "Void"', 'Gross - Tax', 'clean_sales_output.xlsx']
+    }
+    df_rb1 = pd.DataFrame(rb1_data)
+
+    # 3. Rulebook 2: Reporting (Consumes RB1 Output)
+    rb2_data = {
+        'transformation_order': [1, 2],
+        'target_system': ['Final_Report', 'Final_Report'],
+        'source_system': ['file', 'Final_Report'],
+        'source_data': ['Clean_Sales', ''], # Links to RB1 Target System
+        'target_variable': ['', 'Total_Net'],
+        'source_variable': ['', 'Net_Amount'],
+        'operation': ['multicopy', 'sum'],
+        'parameter': ['', '']
+    }
+    df_rb2 = pd.DataFrame(rb2_data)
+
+    # --- B. Execute Transformation (Engine) ---
+    print("\n--- Running Execution Engine ---")
+    executor = RulebookExecutor()
+    # Save generic rulebooks to disk for executor to load
+    df_rb1.to_csv('rb_clean.csv', index=False)
+    executor.execute('rb_clean.csv')
+
+    # --- C. Build Lineage (Architect) ---
+    print("\n--- Building Lineage Graph ---")
+    architect = LineageArchitect()
+    architect.ingest_rulebook("RB_Cleaning", df_rb1)
+    architect.ingest_rulebook("RB_Reporting", df_rb2)
+    architect.stitch_rulebooks()
+
+    # --- D. Explain & Visualize ---
+    target_node = "RB_Reporting::Final_Report::Total_Net"
+    
+    # 1. Narrative
+    print(f"\n--- Narrative for {target_node} ---")
+    narrator = SemanticNarrator(architect, target_node)
+    print(narrator.explain())
+
+    # 2. Visualization
+    print("\n--- Generating Visualization ---")
+    viz = InteractiveVisualizer(architect)
+    viz.plot_upstream(target_node, "demo_lineage.html")
+    
+    print("\nComplete. Check 'demo_lineage.html' for the interactive graph.")
