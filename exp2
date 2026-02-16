@@ -220,6 +220,124 @@ class EnterpriseLineageEngine:
         return df_res[['Step', 'Operation', 'Source', 'Target', 'Type']].drop_duplicates()
 
 # ==========================================
+# 3. The Visualizer (Visualization Core)
+# ==========================================
+
+class LineageVisualizer:
+    def __init__(self, engine):
+        self.graph = engine.graph
+
+    def _style_node(self, node_id, is_target=False):
+        """Returns PyVis style dict based on node type."""
+        label = node_id.split("::")[-1]
+        title = node_id.replace("::", "\n↳ ")
+        
+        if "FILE" in node_id:
+            return {"label": label, "title": title, "color": "#E0E0E0", "shape": "square", "size": 25} # Grey Square
+        elif is_target:
+            return {"label": label, "title": title, "color": "#FF6961", "shape": "star", "size": 35}   # Red Star
+        else:
+            return {"label": label[:15], "title": title, "color": "#97C2FC", "shape": "dot", "size": 15} # Blue Dot
+
+    # --- Mode 1: Entire Graph ---
+    def visualize_entire_graph(self, output_file="full_lineage.html"):
+        """Renders the complete system of rulebooks."""
+        net = Network(height="900px", width="100%", directed=True, select_menu=True, filter_menu=True, cdn_resources='remote')
+        
+        for n in self.graph.nodes():
+            style = self._style_node(n)
+            net.add_node(n, **style)
+        
+        for u, v, d in self.graph.edges(data=True):
+            net.add_edge(u, v, title=d.get('operation'), color="#bdbdbd", arrows="to")
+
+        net.show_buttons(filter_=['physics'])
+        net.save_graph(output_file)
+        print(f"Entire graph saved to {output_file}")
+
+    # --- Mode 2: Single Variable Lineage (Upstream & Downstream) ---
+    def visualize_variable_lineage(self, target_rulebook, target_system, target_variable, output_file="variable_lineage.html"):
+        """Traces where a variable came from AND where it goes next."""
+        target_node = f"{target_rulebook}::{target_system}::{target_variable}"
+        
+        if target_node not in self.graph:
+            print(f"Node {target_node} not found.")
+            return
+
+        # Upstream (Ancestors)
+        upstream = nx.ancestors(self.graph, target_node)
+        # Downstream (Descendants)
+        downstream = nx.descendants(self.graph, target_node)
+        
+        relevant_nodes = upstream.union(downstream).union({target_node})
+        subgraph = self.graph.subgraph(relevant_nodes)
+
+        net = Network(height="800px", width="100%", directed=True, select_menu=True, cdn_resources='remote')
+        
+        for n in subgraph.nodes():
+            is_tgt = (n == target_node)
+            style = self._style_node(n, is_tgt)
+            # Distinct colors for upstream vs downstream
+            if n in upstream: style['color'] = "#A0D468" # Green for inputs
+            if n in downstream: style['color'] = "#FFCE54" # Yellow for outputs
+            if is_tgt: style['color'] = "#FF6961" # Red for Focus
+            
+            net.add_node(n, **style)
+
+        for u, v, d in subgraph.edges(data=True):
+            net.add_edge(u, v, label=d.get('operation'), title=f"Op: {d.get('operation')}\nParam: {d.get('param')}", color="#848484")
+
+        # Hierarchical Layout (Left-to-Right)
+        net.set_options(json.dumps({
+            "layout": {"hierarchical": {"enabled": True, "direction": "LR", "sortMethod": "directed"}},
+            "physics": {"enabled": False}
+        }))
+        net.save_graph(output_file)
+        print(f"Variable lineage saved to {output_file}")
+
+    # --- Mode 3: Operation Tree (Static Tree View) ---
+    def visualize_operation_tree(self, target_rulebook, target_system, target_variable):
+        """
+        Generates a static matplotlib tree diagram showing the calculation logic.
+        Great for understanding complex formulas.
+        """
+        target_node = f"{target_rulebook}::{target_system}::{target_variable}"
+        if target_node not in self.graph: return
+        
+        # Get explicit upstream only (limit depth for readability)
+        ancestors = nx.ancestors(self.graph, target_node)
+        sub = self.graph.subgraph(ancestors.union({target_node}))
+        
+        # Use Graphviz layout (requires pydot) or Shell layout
+        try:
+            pos = nx.nx_agraph.graphviz_layout(sub, prog='dot')
+        except:
+            pos = nx.spring_layout(sub)
+
+        plt.figure(figsize=(12, 8))
+        
+        # Draw Nodes
+        nx.draw_networkx_nodes(sub, pos, node_size=2000, node_color="lightblue", alpha=0.9)
+        
+        # Draw Labels (Clean names)
+        labels = {n: n.split("::")[-1] for n in sub.nodes()}
+        nx.draw_networkx_labels(sub, pos, labels, font_size=9, font_weight="bold")
+        
+        # Draw Edges with Operation Labels
+        edge_labels = {(u, v): f"{d.get('operation')}\n({d.get('param')})" if d.get('param') else d.get('operation') 
+                       for u, v, d in sub.edges(data=True)}
+        nx.draw_networkx_edges(sub, pos, edge_color="grey", arrowstyle="-|>", arrowsize=20)
+        nx.draw_networkx_edge_labels(sub, pos, edge_labels=edge_labels, font_size=8)
+        
+        plt.title(f"Logic Tree: {target_variable}", fontsize=14)
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+
+
+
+# ==========================================
 # Example Usage Scenarios
 # ==========================================
 
@@ -277,3 +395,16 @@ if __name__ == "__main__":
     pd.set_option('display.max_colwidth', None)
     pd.set_option('display.width', 1000)
     print(df_lineage.to_string(index=False))
+
+
+    viz = LineageVisualizer(engine)
+
+    # 1. Full Graph
+    viz.visualize_entire_graph("full_graph.html")
+
+    # 2. Focused Lineage (Net_Sales is input for Report, output of Prep)
+    # This will show Source -> Net_Sales -> Final_Metric
+    viz.visualize_variable_lineage("RB_Prep", "CleanData", "Net_Sales", "focused_lineage.html")
+
+    # 3. Logic Tree (Requires matplotlib)
+    # viz.visualize_operation_tree("RB_Prep", "CleanData", "Net_Sales") 
