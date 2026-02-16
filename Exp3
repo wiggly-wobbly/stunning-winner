@@ -1,0 +1,372 @@
+import pandas as pd
+import networkx as nx
+import re
+import os
+import json
+import matplotlib.pyplot as plt
+from pyvis.network import Network
+
+# ==========================================
+# 1. Configuration & Constants
+# ==========================================
+
+FORMULA_STOPWORDS = {
+    'if', 'sum', 'avg', 'count', 'max', 'min', 'and', 'or', 'not', 'true', 'false',
+    'date', 'year', 'month', 'day', 'int', 'float', 'str', 'coalesce', 'concat',
+    'return', 'where', 'select', 'case', 'when', 'then', 'else', 'end', 'isnull',
+    'left', 'right', 'mid', 'len', 'trim', 'value'
+}
+
+# ==========================================
+# 2. Enterprise Lineage Engine (The "Brain")
+# ==========================================
+
+class EnterpriseLineageEngine:
+    def __init__(self):
+        # Global graph: Stores explicit connections defined in rulebooks
+        self.graph = nx.MultiDiGraph()
+        self.system_registry = {} 
+
+    def _get_sys_id(self, rulebook, system):
+        return f"{rulebook}::{str(system).strip()}"
+
+    def _get_var_id(self, rulebook, system, variable):
+        return f"{rulebook}::{str(system).strip()}::{str(variable).strip()}"
+
+    def _parse_vars(self, param):
+        """Extracts potential column names from formulas."""
+        if pd.isna(param): return []
+        no_strings = re.sub(r'([\'"])(?:(?=(\\?))\2.)*?\1', '', str(param))
+        candidates = re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*', no_strings)
+        return [c for c in candidates if c.lower() not in FORMULA_STOPWORDS]
+
+    def ingest_rulebook(self, rulebook_name, df_rulebook):
+        """Parses a rulebook DataFrame and populates the graph."""
+        df = df_rulebook.copy()
+        df.columns = [c.lower().strip() for c in df.columns]
+        if 'transformation_order' in df.columns:
+            df = df.sort_values('transformation_order')
+
+        # Register Systems
+        for sys in df['target_system'].unique():
+            if pd.notna(sys): self.system_registry[sys] = rulebook_name
+
+        for _, row in df.iterrows():
+            self._process_row(rulebook_name, row)
+
+    def _process_row(self, rb_name, row):
+        op = str(row.get('operation', '')).lower().strip()
+        step = row.get('transformation_order')
+        tgt_sys = row.get('target_system')
+        src_sys = row.get('source_system')
+        src_data = row.get('source_data')
+        
+        tgt_vars = [x.strip() for x in str(row.get('target_variable')).split(',')] if pd.notna(row.get('target_variable')) else []
+        src_vars_raw = [x.strip() for x in str(row.get('source_variable')).split(',')] if pd.notna(row.get('source_variable')) else []
+        param = row.get('parameter')
+
+        # 1. System Lineage (The Backbone)
+        tgt_sys_node = self._get_sys_id(rb_name, tgt_sys)
+        
+        # Internal Link
+        if pd.notna(src_sys):
+            src_sys_node = self._get_sys_id(rb_name, src_sys)
+            self.graph.add_edge(src_sys_node, tgt_sys_node, type='system_flow', operation=op, step=step)
+        
+        # External/Cross-Book Link
+        if pd.notna(src_data):
+            if src_data in self.system_registry:
+                origin_rb = self.system_registry[src_data]
+                src_sys_node = self._get_sys_id(origin_rb, src_data)
+                self.graph.add_edge(src_sys_node, tgt_sys_node, type='cross_link', operation=op, step=step)
+            else:
+                src_sys_node = f"FILE::{src_data}"
+                self.graph.add_edge(src_sys_node, tgt_sys_node, type='file_load', operation=op, step=step)
+
+        # 2. Explicit Variable Lineage
+        explicit_sources = set(src_vars_raw)
+        if op in ['calculate', 'formula', 'conditional']:
+            explicit_sources.update(self._parse_vars(param))
+
+        for t_var in tgt_vars:
+            t_node = self._get_var_id(rb_name, tgt_sys, t_var)
+            
+            # Link Explicit Sources
+            for s_var in explicit_sources:
+                eff_src_sys = src_sys if pd.notna(src_sys) else tgt_sys
+                
+                # Check for cross-book variable source
+                if pd.isna(src_sys) and pd.notna(src_data) and src_data in self.system_registry:
+                     s_node = self._get_var_id(self.system_registry[src_data], src_data, s_var)
+                else:
+                     s_node = self._get_var_id(rb_name, eff_src_sys, s_var)
+
+                self.graph.add_edge(s_node, t_node, type='variable_flow', operation=op, step=step, param=param)
+        
+        # 3. Lookup Handling
+        if op in ['lookup', 'merge'] and pd.notna(row.get('lookup_column')):
+            lkp_node = self._get_var_id(rb_name, row.get('lookup_table'), row.get('lookup_column'))
+            eff_tgt = tgt_vars[0] if tgt_vars else row.get('lookup_column')
+            t_node = self._get_var_id(rb_name, tgt_sys, eff_tgt)
+            self.graph.add_edge(lkp_node, t_node, type='lookup_flow', operation=op, step=step, param=row.get('lookup_key'))
+
+
+    def get_recursive_subgraph(self, target_rulebook, target_system, target_variable):
+        """
+        The 'Healer' Function:
+        Returns a DiGraph containing the lineage. 
+        If explicit edges are missing, it INFERS them from System connections.
+        """
+        lineage_graph = nx.DiGraph()
+        start_node = self._get_var_id(target_rulebook, target_system, target_variable)
+        
+        if start_node not in self.graph: 
+            # If variable not found, try to find if it exists in a file
+            # This is a fallback for testing
+            return lineage_graph
+
+        visited = set()
+
+        def _trace(current_node):
+            if current_node in visited: return
+            visited.add(current_node)
+            
+            # Stop if it's a file
+            if "FILE::" in current_node: return
+
+            # 1. Check EXPLICIT Parents (Defined in rulebook)
+            explicit_parents = []
+            if current_node in self.graph:
+                for u, v, data in self.graph.in_edges(current_node, data=True):
+                    explicit_parents.append((u, data))
+            
+            # 2. HEALING LOGIC: If no explicit parents, check System Inheritance
+            if not explicit_parents:
+                parts = current_node.split("::")
+                if len(parts) == 3:
+                    curr_rb, curr_sys, curr_var = parts
+                    curr_sys_node = f"{curr_rb}::{curr_sys}"
+                    
+                    if curr_sys_node in self.graph:
+                        # Find systems that feed this system
+                        for u_sys, v_sys, data in self.graph.in_edges(curr_sys_node, data=True):
+                            # Construct the 'Inferred' source variable node
+                            op = data.get('operation', 'inherit')
+                            
+                            # If source is a file
+                            if "FILE::" in u_sys:
+                                src_var_node = f"{u_sys}::{curr_var}"
+                            else:
+                                # If source is another system
+                                src_rb_part, src_sys_part = u_sys.split("::")[:2]
+                                src_var_node = f"{src_rb_part}::{src_sys_part}::{curr_var}"
+                            
+                            # Create an 'Inherited' edge
+                            inferred_data = {
+                                'operation': f"{op} (Implicit)", 
+                                'type': 'inherited',
+                                'param': data.get('param')
+                            }
+                            explicit_parents.append((src_var_node, inferred_data))
+
+            # 3. Add Edges to Lineage Graph and Recurse
+            for parent, data in explicit_parents:
+                lineage_graph.add_edge(parent, current_node, **data)
+                _trace(parent)
+
+        # Start Trace
+        _trace(start_node)
+        return lineage_graph
+
+# ==========================================
+# 3. The Visualizer (Visualization Core)
+# ==========================================
+
+class LineageVisualizer:
+    def __init__(self, engine):
+        self.engine = engine
+        self.full_graph = engine.graph
+
+    def _style_node(self, node_id, is_target=False, is_file=False, is_inferred=False):
+        """Returns PyVis style dict."""
+        label = node_id.split("::")[-1]
+        title = node_id.replace("::", "\n↳ ")
+        
+        if is_file or "FILE::" in node_id:
+            return {"label": label, "title": title, "color": "#E0E0E0", "shape": "square", "size": 25}
+        elif is_target:
+            return {"label": label, "title": title, "color": "#FF6961", "shape": "star", "size": 35}
+        elif is_inferred:
+            return {"label": label, "title": title + "\n(Inferred)", "color": "#F6BB42", "shape": "dot", "size": 15, "dashes": True}
+        else:
+            return {"label": label[:15], "title": title, "color": "#97C2FC", "shape": "dot", "size": 20}
+
+    # --- Mode 1: Entire Graph ---
+    def visualize_entire_graph(self, output_file="full_lineage.html"):
+        """Renders the complete macro-system view."""
+        net = Network(height="900px", width="100%", directed=True, select_menu=True, filter_menu=True, cdn_resources='remote')
+        
+        # Use full graph from engine
+        for n in self.full_graph.nodes():
+            style = self._style_node(n)
+            net.add_node(n, **style)
+        
+        for u, v, d in self.full_graph.edges(data=True):
+            # Differentiate System flow vs Variable flow
+            color = "#bdbdbd"
+            width = 1
+            if d.get('type') == 'system_flow': 
+                color = "#a0a0a0"
+                width = 3 
+            
+            net.add_edge(u, v, title=f"Op: {d.get('operation')}", label=d.get('operation')[:5], color=color, width=width, arrows="to")
+
+        net.show_buttons(filter_=['physics'])
+        net.save_graph(output_file)
+        print(f"Entire graph saved to {output_file}")
+
+    # --- Mode 2: Single Variable Lineage (Recursive & Healed) ---
+    def visualize_variable_lineage(self, target_rulebook, target_system, target_variable, output_file="variable_lineage.html"):
+        """
+        Uses the Recursive Healer to find the path, then visualizes it.
+        """
+        # 1. Get the Healed Subgraph
+        subgraph = self.engine.get_recursive_subgraph(target_rulebook, target_system, target_variable)
+        target_node = self.engine._get_var_id(target_rulebook, target_system, target_variable)
+        
+        if len(subgraph.nodes) == 0:
+            print(f"No lineage found for {target_node}")
+            return
+
+        # 2. Build Visualization
+        net = Network(height="800px", width="100%", directed=True, select_menu=True, cdn_resources='remote')
+        
+        for n in subgraph.nodes():
+            is_tgt = (n == target_node)
+            # Detect if this node was inferred (not in original graph)
+            is_inferred = n not in self.engine.graph and "FILE" not in n
+            
+            style = self._style_node(n, is_target=is_tgt, is_inferred=is_inferred)
+            net.add_node(n, **style)
+
+        for u, v, d in subgraph.edges(data=True):
+            # Style implicit edges differently
+            is_implicit = "Implicit" in d.get('operation', '')
+            color = "#F6BB42" if is_implicit else "#848484"
+            dashes = True if is_implicit else False
+            
+            label = d.get('operation')
+            title = f"Operation: {label}\nParam: {d.get('param', '')}"
+            
+            net.add_edge(u, v, label=label, title=title, color=color, dashes=dashes, arrows="to")
+
+        # Hierarchical Layout
+        net.set_options(json.dumps({
+            "layout": {"hierarchical": {"enabled": True, "direction": "LR", "sortMethod": "directed", "levelSeparation": 250}},
+            "physics": {"enabled": False},
+            "interaction": {"hover": True}
+        }))
+        net.save_graph(output_file)
+        print(f"Variable lineage saved to {output_file}")
+
+    # --- Mode 3: Operation Tree (Static + Params) ---
+    def visualize_operation_tree(self, target_rulebook, target_system, target_variable):
+        """
+        Generates a static Logic Tree using Matplotlib. 
+        Great for seeing formulas and parameters clearly.
+        """
+        # 1. Get Subgraph
+        subgraph = self.engine.get_recursive_subgraph(target_rulebook, target_system, target_variable)
+        if len(subgraph.nodes) == 0: return
+
+        # 2. Layout (Tree/Hierarchical)
+        try:
+            # Try graphviz if available (best for trees)
+            pos = nx.nx_agraph.graphviz_layout(subgraph, prog='dot')
+        except:
+            # Fallback to shell/spring
+            pos = nx.shell_layout(subgraph)
+
+        plt.figure(figsize=(14, 8))
+        
+        # 3. Draw Nodes
+        node_colors = []
+        labels = {}
+        for n in subgraph.nodes():
+            parts = n.split("::")
+            labels[n] = parts[-1] # Just variable name
+            if "FILE" in n: node_colors.append('#E0E0E0')
+            elif n == f"{target_rulebook}::{target_system}::{target_variable}": node_colors.append('#FF6961')
+            else: node_colors.append('#A0D468')
+
+        nx.draw_networkx_nodes(subgraph, pos, node_size=2500, node_color=node_colors, node_shape="o", alpha=0.9)
+        nx.draw_networkx_labels(subgraph, pos, labels, font_size=10, font_weight="bold")
+
+        # 4. Draw Edges (Annotated with Logic)
+        edge_labels = {}
+        for u, v, d in subgraph.edges(data=True):
+            op = d.get('operation')
+            param = d.get('param')
+            # Format: "calculate\n(A + B)"
+            lbl = f"{op}"
+            if param and str(param) != 'nan':
+                lbl += f"\n({str(param)[:15]}...)"
+            edge_labels[(u,v)] = lbl
+
+        nx.draw_networkx_edges(subgraph, pos, edge_color="gray", arrowstyle="-|>", arrowsize=20)
+        nx.draw_networkx_edge_labels(subgraph, pos, edge_labels=edge_labels, font_size=8, bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+        plt.title(f"Logic Tree: {target_variable}", fontsize=16)
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+# ==========================================
+# 4. Usage Simulation
+# ==========================================
+
+if __name__ == "__main__":
+    # --- Data Setup: Creating a "Broken" Lineage Scenario ---
+    # Rulebook A: Loads File -> Multicopy (Implicit Region pass-through) -> Calc
+    rb_a = pd.DataFrame({
+        'transformation_order': [1, 2],
+        'target_system': ['CleanData', 'CleanData'],
+        'source_system': ['file', 'CleanData'],
+        'source_data': ['RawSales.csv', ''],
+        'target_variable': ['', 'Net_Sales'],
+        'source_variable': ['', 'Gross, Tax'],
+        'operation': ['multicopy', 'calculate'], 
+        'parameter': ['', 'Gross - Tax']
+    })
+
+    # Rulebook B: Consumes RB_A -> Renames implicit Region -> Final Target
+    rb_b = pd.DataFrame({
+        'transformation_order': [1, 2],
+        'target_system': ['FinalReport', 'FinalReport'],
+        'source_system': ['CleanData', 'FinalReport'], # Links to RB_A
+        'source_data': ['CleanData', ''], 
+        'target_variable': ['', 'Region_Code'],
+        'source_variable': ['', 'Region'], # 'Region' was implicit in RB_A
+        'operation': ['multicopy', 'rename'],
+        'parameter': ['', 'Region:Region_Code']
+    })
+
+    # --- Execution ---
+    print("Ingesting Rulebooks...")
+    engine = EnterpriseLineageEngine()
+    engine.ingest_rulebook("RB_Prep", rb_a)
+    engine.ingest_rulebook("RB_Final", rb_b)
+
+    viz = LineageVisualizer(engine)
+
+    # 1. Visualize Macro Graph
+    viz.visualize_entire_graph("macro_view.html")
+
+    # 2. Visualize Specific Variable (Testing Recursive Healer)
+    # This should find 'RawSales.csv::Region' even though it was never explicitly mapped in RB_Prep
+    print("Generating Variable Lineage...")
+    viz.visualize_variable_lineage("RB_Final", "FinalReport", "Region_Code", "region_lineage.html")
+
+    # 3. Visualize Logic Tree (Static)
+    print("Generating Logic Tree...")
+    viz.visualize_operation_tree("RB_Final", "FinalReport", "Region_Code")
