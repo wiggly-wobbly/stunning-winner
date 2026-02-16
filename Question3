@@ -1,0 +1,36 @@
+Here is a comprehensive, professionally engineered prompt designed to instruct an advanced AI model to generate the complete Enterprise Data Lineage solution.
+PROMPT START
+Role: You are a Principal Data Architect and Python Expert specializing in Metadata Management and Graph Theory.
+Objective:
+Develop a single, production-ready Python script that implements an Enterprise Data Transformation & Lineage Engine. This engine must interpret "Rulebooks" (tabular transformation logic), execute the data transformations using Pandas, build a recursive lineage graph using NetworkX, and provide both semantic explanations and interactive visualizations of the data flow.
+Context - The "Rulebook" Structure:
+The system processes "Rulebooks" which are CSV/Excel files defining data pipelines. Each row represents a step.
+ * Columns: transformation_order, target_system, source_system, source_data, target_variable, source_variable, operation, parameter, lookup_table, lookup_column.
+ * Scope: The engine must support 47 specific operations ranging from basic (e.g., rename, convert, filter) to complex (e.g., merge, cumulative sum, upload formula).
+ * Connectivity: Rulebooks can be chained. The target_system of one rulebook can be the source_data of another.
+Core Functional Requirements:
+1. The Execution Engine (Pandas)
+ * Create a RulebookExecutor class.
+ * It must dynamically parse the rulebook and execute operations on Pandas DataFrames.
+ * Implement logic for critical operations: multicopy (ingestion), calculate (formula eval), filter (query), merge (joins), aggregate (groupby), and cross_rulebook handoffs.
+2. The Lineage Architect (NetworkX)
+ * Create an EnterpriseLineageEngine class.
+ * Graph Construction: Build a MultiDiGraph where nodes are namespaced (e.g., Rulebook::System::Variable) and edges represent operations.
+ * Cross-System Stitching: Automatically detect when a source_data in Rulebook B matches a target_system in Rulebook A and create "Cross-Link" edges.
+ * Recursive "Healer" Logic (Critical): Implement a recursive tracing method (get_recursive_subgraph). It must fix "broken" lineage paths where columns are passed through system-level operations (like multicopy or filter) without being explicitly named. If a variable has no explicit parent, the engine must infer the parent from the System-Level lineage connections.
+3. The Semantic Narrator (NLP & Business Context)
+ * Create a SemanticNarrator class.
+ * Intent Mapping: Map technical operations to business intents (e.g., filter → "Quality Control", lookup → "Enrichment").
+ * Story Generation: Given a target variable, traverse the graph and generate a step-by-step, natural language audit trail explaining how and why the data was transformed.
+4. The Visualization Suite (Pyvis & Matplotlib)
+ * Create a LineageVisualizer class with three modes:
+   * Macro View: An interactive HTML graph (pyvis) showing the high-level flow of all Systems and Files.
+   * Variable Trace: An interactive HTML graph (pyvis) focused on a single variable. It must differentiate between Explicit Edges (solid lines) and Inferred/Healed Edges (dashed/yellow lines).
+   * Logic Tree: A static matplotlib tree diagram showing the calculation logic (operation + parameters) for auditing complex formulas.
+Technical Constraints:
+ * Libraries: Use pandas, networkx, numpy, pyvis, and matplotlib.
+ * Code Quality: Use modular OOP design, type hinting where useful, and robust error handling.
+ * Demo: Include a if __name__ == "__main__": block that generates dummy rulebooks (Scenario: A "Cleaning" book feeding a "Reporting" book), runs the execution, builds the graph, and generates all 3 visualization types.
+Output:
+Generate the complete, single-file Python script. Do not summarize; provide the full executable code.
+PROMPT END
