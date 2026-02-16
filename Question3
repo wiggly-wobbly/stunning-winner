@@ -34,3 +34,26 @@ Technical Constraints:
 Output:
 Generate the complete, single-file Python script. Do not summarize; provide the full executable code.
 PROMPT END
+
+
+Build a fault-tolerant, directed acyclic graph (DAG) that maps data flow at both the System Level (Dataframe-to-Dataframe) and Variable Level (Column-to-Column). The engine must guarantee that a lineage trace never "breaks" due to implicit operations (e.g., passing a column through a filter without renaming it).
+​Core Requirements:
+​Dual-Layer Graph Construction:
+​Nodes: Must be namespaced to avoid collisions: "{Rulebook}::{System}::{Variable}".
+​Edges: Must store rich metadata: operation (e.g., "calculate"), parameter (e.g., "A + B"), step_order, and type ("explicit" vs. "inferred").
+​System Linking: Create edges between Systems when operations like multicopy, merge, or append are used.  
+​Cross-Rulebook Stitching: Automatically detect when source_data in one rulebook matches a target_system from another and create a "Bridge Edge" to connect them.
+​The "Hybrid Traversal" Algorithm (Critical):
+​Implement a method trace_lineage(target_rb, target_sys, target_var, stop_at_system=None) that traces backwards from the target.
+​Step 1 (Explicit Check): Look for direct parent nodes defined by operations like calculate, rename, or convert.  
+​Step 2 (The "Healer" Logic): If no explicit parent variable is found, the engine MUST inspect the System-Level Edges.
+​Scenario: If System_B was created from System_A via filter, and Var_X exists in both, but no explicit instruction maps them:  
+​Action: Dynamically INFER an edge: System_A::Var_X → System_B::Var_X.
+​Metadata: Label this inferred edge with the system operation (e.g., "Inherited via Filter: Status='Active'").
+​Recursion: Continue this process recursively until the trace hits a raw "File" node or matches the stop_at_system parameter.
+​Complex Operation Handling:
+​Formulas: For calculate or conditional, use Regex to extract all referenced variables from the parameter string and link them as parents (e.g., IF(A>0, B, C) depends on A, B, and C).  
+​Lookups: For lookup or merge, link the target variable to the specific lookup_column in the lookup_table.  
+​Output:
+​The trace function must return a structured object (e.g., a Pandas DataFrame or JSON) detailing every hop: [Step #, Source Node, Operation, Parameter, Target Node, Type (Explicit/Inferred)].
+
