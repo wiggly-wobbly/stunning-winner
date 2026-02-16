@@ -1,0 +1,279 @@
+import pandas as pd
+import networkx as nx
+import re
+
+# --- Configuration ---
+FORMULA_STOPWORDS = {
+    'if', 'sum', 'avg', 'count', 'max', 'min', 'and', 'or', 'not', 'true', 'false',
+    'date', 'year', 'month', 'day', 'int', 'float', 'str', 'coalesce', 'concat',
+    'return', 'where', 'select', 'case', 'when', 'then', 'else', 'end', 'isnull'
+}
+
+class EnterpriseLineageEngine:
+    def __init__(self):
+        # Graph stores both System nodes (RB::Sys) and Variable nodes (RB::Sys::Var)
+        self.graph = nx.MultiDiGraph()
+        self.system_registry = {}  # Map: system_name -> rulebook_name
+
+    def _get_sys_id(self, rulebook, system):
+        return f"{rulebook}::{str(system).strip()}"
+
+    def _get_var_id(self, rulebook, system, variable):
+        return f"{rulebook}::{str(system).strip()}::{str(variable).strip()}"
+
+    def _parse_vars(self, param):
+        """Extract potential variables from formulas/params."""
+        if pd.isna(param): return []
+        # Remove string literals to avoid false positives
+        no_strings = re.sub(r'([\'"])(?:(?=(\\?))\2.)*?\1', '', str(param))
+        candidates = re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*', no_strings)
+        return [c for c in candidates if c.lower() not in FORMULA_STOPWORDS]
+
+    def ingest_rulebook(self, rulebook_name, df_rulebook):
+        """
+        Parses rulebook to build the base connectivity graph.
+        """
+        df = df_rulebook.copy()
+        df.columns = [c.lower().strip() for c in df.columns]
+        if 'transformation_order' in df.columns:
+            df = df.sort_values('transformation_order')
+
+        # 1. Register Systems for Cross-Rulebook Linking
+        for sys in df['target_system'].unique():
+            if pd.notna(sys): self.system_registry[sys] = rulebook_name
+
+        # 2. Process Edges
+        for _, row in df.iterrows():
+            self._process_row(rulebook_name, row)
+
+    def _process_row(self, rb_name, row):
+        op = str(row.get('operation', '')).lower().strip()
+        step = row.get('transformation_order')
+        tgt_sys = row.get('target_system')
+        src_sys = row.get('source_system')
+        src_data = row.get('source_data')
+        
+        tgt_vars = [x.strip() for x in str(row.get('target_variable')).split(',')] if pd.notna(row.get('target_variable')) else []
+        src_vars_raw = [x.strip() for x in str(row.get('source_variable')).split(',')] if pd.notna(row.get('source_variable')) else []
+        
+        # ---------------------------------------------------------
+        # A. SYSTEM LEVEL LINKING (The backbone for inheritance)
+        # ---------------------------------------------------------
+        tgt_sys_node = self._get_sys_id(rb_name, tgt_sys)
+        
+        # 1. Intra-Rulebook System Link
+        if pd.notna(src_sys):
+            src_sys_node = self._get_sys_id(rb_name, src_sys)
+            self.graph.add_edge(src_sys_node, tgt_sys_node, type='system_flow', operation=op, step=step)
+
+        # 2. Cross-Rulebook / External System Link
+        if pd.notna(src_data):
+            if src_data in self.system_registry:
+                # Connected to another rulebook's system
+                origin_rb = self.system_registry[src_data]
+                src_sys_node = self._get_sys_id(origin_rb, src_data)
+                # FIX: Use actual operation name instead of "handoff"
+                self.graph.add_edge(src_sys_node, tgt_sys_node, type='cross_link', operation=op, step=step)
+            else:
+                # External File
+                src_sys_node = f"FILE::{src_data}"
+                self.graph.add_edge(src_sys_node, tgt_sys_node, type='file_load', operation=op, step=step)
+
+        # ---------------------------------------------------------
+        # B. VARIABLE LEVEL LINKING (Explicit Definitions)
+        # ---------------------------------------------------------
+        
+        # Gather all Explicit Sources
+        explicit_sources = set(src_vars_raw)
+        
+        # If formula, gather implicit sources from parameter
+        if op in ['calculate', 'formula', 'conditional']:
+            explicit_sources.update(self._parse_vars(row.get('parameter')))
+
+        # Create Edges for Explicit Targets
+        for t_var in tgt_vars:
+            t_node = self._get_var_id(rb_name, tgt_sys, t_var)
+            
+            # If we have explicit sources, link them
+            for s_var in explicit_sources:
+                # Determine where s_var comes from. 
+                # If src_sys is defined, it comes from there. Else it might be from the target system (in-place calc)
+                effective_src_sys = src_sys if pd.notna(src_sys) else tgt_sys
+                
+                # Cross-rulebook variable handling:
+                # If src_sys isn't defined but src_data IS defined (and it's a rulebook system)
+                if pd.isna(src_sys) and pd.notna(src_data) and src_data in self.system_registry:
+                     origin_rb = self.system_registry[src_data]
+                     s_node = self._get_var_id(origin_rb, src_data, s_var)
+                else:
+                     s_node = self._get_var_id(rb_name, effective_src_sys, s_var)
+
+                self.graph.add_edge(s_node, t_node, type='variable_flow', operation=op, step=step)
+
+        # ---------------------------------------------------------
+        # C. LOOKUP / MERGE HANDLING
+        # ---------------------------------------------------------
+        if op in ['lookup', 'merge'] and pd.notna(row.get('lookup_column')):
+            lkp_tbl = row.get('lookup_table')
+            lkp_col = row.get('lookup_column')
+            lkp_key = row.get('lookup_key')
+            
+            # Source of lookup value
+            lkp_node = self._get_var_id(rb_name, lkp_tbl, lkp_col)
+            
+            # Destination (either specific target var OR the column name itself)
+            eff_tgt_var = tgt_vars[0] if tgt_vars else lkp_col
+            t_node = self._get_var_id(rb_name, tgt_sys, eff_tgt_var)
+            
+            self.graph.add_edge(lkp_node, t_node, type='lookup_flow', operation=op, step=step, details=f"Key: {lkp_key}")
+
+
+    def get_lineage_df(self, target_rulebook, target_system, target_variable):
+        """
+        Traverses the graph recursively from Target to Source.
+        Handles 'Broken' lineage by inferring Pass-Through columns via System edges.
+        """
+        start_node = self._get_var_id(target_rulebook, target_system, target_variable)
+        paths = []
+        visited = set()
+
+        def _recursive_trace(current_node, current_path_id):
+            if current_node in visited and current_node != start_node:
+                return # Avoid cycles
+            visited.add(current_node)
+
+            # 1. Parse Node Info
+            parts = current_node.split("::")
+            if parts[0] == "FILE":
+                return # End of line (Source found)
+            
+            curr_rb, curr_sys, curr_var = parts[0], parts[1], parts[2]
+            curr_sys_node = f"{curr_rb}::{curr_sys}"
+
+            # 2. Check for EXPLICIT Variable Edges (e.g., Calculate, Rename)
+            # We look for incoming edges (parents)
+            explicit_parents = []
+            if current_node in self.graph:
+                for u, v, data in self.graph.in_edges(current_node, data=True):
+                    explicit_parents.append((u, data))
+
+            # 3. If Explicit Parents found, traverse them
+            if explicit_parents:
+                for parent_node, data in explicit_parents:
+                    paths.append({
+                        "Source_Node": parent_node,
+                        "Target_Node": current_node,
+                        "Operation": data.get('operation'),
+                        "Step": data.get('step', 0),
+                        "Type": "Explicit"
+                    })
+                    _recursive_trace(parent_node, current_path_id)
+            
+            # 4. THE FIX: IMPLICIT / INHERITED LINEAGE
+            # If no explicit transformation changed this variable, it might be inherited 
+            # from a System-level operation (multicopy, load, merge, sort, filter)
+            else:
+                # Find System-level parents
+                if curr_sys_node in self.graph:
+                    system_parents = self.graph.in_edges(curr_sys_node, data=True)
+                    
+                    for src_sys_node, tgt_sys_node, data in system_parents:
+                        # Construct the inferred parent variable node
+                        # Logic: SystemA::Col1 -> (multicopy) -> SystemB::Col1
+                        if "FILE" in src_sys_node:
+                            # It came from a file
+                            src_node = f"{src_sys_node}::{curr_var}" # Virtual node for file column
+                        else:
+                            # It came from another system/rulebook
+                            src_rb_part, src_sys_part = src_sys_node.split("::")[:2]
+                            src_node = f"{src_rb_part}::{src_sys_part}::{curr_var}"
+
+                        # Record this inference
+                        paths.append({
+                            "Source_Node": src_node,
+                            "Target_Node": current_node,
+                            "Operation": data.get('operation'),
+                            "Step": data.get('step', 0),
+                            "Type": "Inherited"
+                        })
+                        
+                        # Continue tracing upstream from this inferred parent
+                        _recursive_trace(src_node, current_path_id)
+
+        # Start Recursion
+        _recursive_trace(start_node, 0)
+
+        # Format Result
+        if not paths:
+            return pd.DataFrame(columns=["Step", "Operation", "Source", "Target", "Type"])
+
+        df_res = pd.DataFrame(paths)
+        
+        # Clean up columns for display
+        def clean_name(n): return n.replace("::", " -> ")
+        
+        df_res['Source'] = df_res['Source_Node'].apply(clean_name)
+        df_res['Target'] = df_res['Target_Node'].apply(clean_name)
+        
+        # Sort by step (reverse logic for upstream view isn't perfect with steps, 
+        # so we mostly rely on graph structure, but sorting helps basic readability)
+        return df_res[['Step', 'Operation', 'Source', 'Target', 'Type']].drop_duplicates()
+
+# ==========================================
+# Example Usage Scenarios
+# ==========================================
+
+if __name__ == "__main__":
+    engine = EnterpriseLineageEngine()
+
+    # --- Scenario 1: Setup a Rulebook that causes the "Break" ---
+    # User loads data, then does a calculation. 
+    # The variable "Region" is NOT touched by 'calculate', it is passed through 'multicopy'.
+    
+    # Rulebook A: Pre-processing
+    rb_a = pd.DataFrame({
+        'transformation_order': [1, 2],
+        'target_system': ['CleanData', 'CleanData'],
+        'source_system': ['file', 'CleanData'],
+        'source_data': ['Source.csv', ''],
+        'target_variable': ['', 'Net_Value'],
+        'source_variable': ['', 'Gross, Tax'], 
+        'operation': ['multicopy', 'calculate'], # multicopy passes ALL cols (inc. Region)
+        'parameter': ['', 'Gross - Tax']
+    })
+
+    # Rulebook B: Final Report (Consumes Rulebook A)
+    # It loads CleanData. "Region" still exists here implicitly.
+    rb_b = pd.DataFrame({
+        'transformation_order': [1, 2],
+        'target_system': ['FinalReport', 'FinalReport'],
+        'source_system': ['CleanData', 'FinalReport'], # Source is RB_A's system
+        'source_data': ['CleanData', ''], # Linkage
+        'target_variable': ['', 'Region_Upper'],
+        'source_variable': ['', 'Region'],
+        'operation': ['multicopy', 'convert'], # Uses 'multicopy' to get data from RB_A
+        'parameter': ['', 'uppercase']
+    })
+
+    # Ingest
+    print("Ingesting Rulebooks...")
+    engine.ingest_rulebook("RB_Prep", rb_a)
+    engine.ingest_rulebook("RB_Final", rb_b)
+
+    # --- Scenario 2: Trace "Broken" Lineage ---
+    # We want to find lineage of 'Region_Upper' in RB_Final.
+    # Logic chain: 
+    # 1. RB_Final::FinalReport::Region_Upper (Explicit convert)
+    # 2. RB_Final::FinalReport::Region (Explicit Source of step 1)
+    # 3. ... [Here it usually breaks] ... it needs to find that 'Region' came from RB_Prep via 'multicopy'
+    # 4. RB_Prep::CleanData::Region (Inherited via cross-link)
+    # 5. RB_Prep::CleanData::Region (Inherited via intra-system multicopy)
+    # 6. FILE::Source.csv::Region (Inherited via file load)
+
+    print("\n--- Generating Lineage DataFrame ---")
+    df_lineage = engine.get_lineage_df("RB_Final", "FinalReport", "Region_Upper")
+    
+    # Display
+    pd.set_option('display.max_colwidth', None)
+    pd.set_option('display.width', 1000)
+    print(df_lineage.to_string(index=False))
